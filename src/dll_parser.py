@@ -67,11 +67,13 @@ def parse_dll(dll_path: str) -> DllInfo:
                     name = sym.name.decode("latin-1")
 
             forwarder: Optional[str] = None
-            if sym.forwarder_string:
+            # pefile attribute name differs across versions: try both
+            _fwd_raw = getattr(sym, "forwarder_string", None) or getattr(sym, "forwarder", None)
+            if _fwd_raw:
                 try:
-                    forwarder = sym.forwarder_string.decode("utf-8")
+                    forwarder = _fwd_raw.decode("utf-8")
                 except UnicodeDecodeError:
-                    forwarder = sym.forwarder_string.decode("latin-1")
+                    forwarder = _fwd_raw.decode("latin-1")
 
             exports.append(
                 ExportEntry(
