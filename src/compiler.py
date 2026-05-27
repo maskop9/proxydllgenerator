@@ -91,9 +91,8 @@ def check_compilers(architectures: list[str]) -> dict[str, Optional[str]]:
 # ---------------------------------------------------------------------------
 
 _COMMON_FLAGS = [
-    "-O2",          # optimise
-    "-s",           # strip symbols – smaller output
-    "-fexceptions", # enable SEH (__try/__except) support in MinGW
+    "-O2",  # optimise
+    "-s",   # strip symbols – smaller output
 ]
 
 
