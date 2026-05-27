@@ -1,103 +1,69 @@
 # proxydllgenerator
 
 A Python tool that automates building proxy DLLs for DLL hijacking.  
-Given an original DLL and a raw shellcode payload, it generates a
-replacement DLL that:
+Given a DLL and a raw shellcode payload, it generates a replacement DLL that:
 
-- **Forwards** every named export to the original DLL via PE linker-level
-  forwarder entries (DEF file `Name=original.Name` syntax).
-- **Executes** the shellcode payload in a dedicated thread spawned from
-  `DllMain` on `DLL_PROCESS_ATTACH`, avoiding loader-lock issues.
+- **Forwards** every named export to the real DLL via runtime `LoadLibrary` + assembly JMP stubs — no rename of the original required.
+- **Executes** the shellcode in a dedicated thread spawned from `DllMain` on `DLL_PROCESS_ATTACH`.
 
-Compilation is performed by **MinGW-w64 cross-compilers**, so the tool
-works identically on Linux, macOS, and Windows regardless of the host
-architecture.
+Compilation is performed by **MinGW-w64 cross-compilers**, so the tool works on Linux, macOS, and Windows regardless of host architecture.
 
 ---
 
 ## Prerequisites
 
-### 1 – Python 3.9 or newer
-
-```
-python --version   # must be >= 3.9
-```
-
-### 2 – Python dependencies
+### Python 3.9+
 
 ```bash
 pip install -r requirements.txt
 ```
 
-| Package | Minimum version | Purpose |
-|---------|-----------------|---------|
-| `pefile` | 2023.2.7 | Parse PE export directories |
+| Package | Purpose |
+|---------|---------|
+| `pefile >= 2023.2.7` | Parse PE export directories |
 
-### 3 – MinGW-w64 cross-compilers
+### MinGW-w64 cross-compilers
 
-The tool requires the following compiler binaries to be in `PATH`:
-
-| Target arch | Required binary |
-|-------------|-----------------|
+| Target | Binary required |
+|--------|----------------|
 | AMD x64 | `x86_64-w64-mingw32-gcc` |
 | AMD x86 | `i686-w64-mingw32-gcc` |
 
-#### Linux (Ubuntu / Debian)
-
+**Ubuntu / Debian**
 ```bash
-sudo apt-get update
 sudo apt-get install mingw-w64
 ```
 
-#### Linux (Fedora / RHEL / AlmaLinux)
-
+**Fedora / RHEL**
 ```bash
 sudo dnf install mingw64-gcc mingw32-gcc
 ```
 
-#### Linux (Arch Linux)
-
+**Arch Linux**
 ```bash
 sudo pacman -S mingw-w64-gcc
 ```
 
-#### macOS
-
+**macOS**
 ```bash
 brew install mingw-w64
 ```
 
-> **Note:** The Homebrew formula installs both x86_64 and i686 compilers.
-
-#### Windows (MSYS2 — recommended)
-
-1. Download and install MSYS2 from <https://www.msys2.org/>
-2. Open an **MSYS2 MinGW** shell and run:
-
+**Windows (MSYS2)**
 ```bash
 pacman -S mingw-w64-x86_64-gcc mingw-w64-i686-gcc
 ```
-
-3. Add the MinGW `bin` directories to your Windows `PATH`:
-   - `C:\msys64\mingw64\bin`
-   - `C:\msys64\mingw32\bin`
-
-#### Windows (standalone MinGW-w64)
-
-Download the installer from <https://www.mingw-w64.org/downloads/> and
-add the `bin` folder to your `PATH`.
+Add `C:\msys64\mingw64\bin` and `C:\msys64\mingw32\bin` to `PATH`.
 
 ---
 
 ## Installation
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/maskop9/proxydllgenerator
 cd proxydllgenerator
 pip install -r requirements.txt
 ```
-
-No other installation steps are required.
 
 ---
 
@@ -107,55 +73,36 @@ No other installation steps are required.
 python proxydll.py -dll <DLL_PATH> -shellcode <SHELLCODE_PATH> [options]
 ```
 
-### Required arguments
+### Required
 
 | Argument | Description |
 |----------|-------------|
-| `-dll <path>` | Path to the **original** DLL you want to proxy |
-| `-shellcode <path>` | Path to a **raw binary** shellcode file |
+| `-dll <path>` | Path to the DLL to proxy (used to parse exports) |
+| `-shellcode <path>` | Path to a raw binary shellcode file |
 
-### Optional arguments
+### Optional
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `-arch x64\|x86\|all` | `all` | Target architecture(s) to build |
-| `-o / --output <name>` | Same as input DLL | Output DLL base name (no extension) |
-| `--orig-name <name>` | `<dll>_orig` | Base name the original DLL will be renamed to |
+| `-arch x64\|x86\|all` | `all` | Target architecture(s) |
+| `-o / --output <name>` | Same as input DLL | Output filename (no extension) |
 | `--output-dir <dir>` | `./output` | Root directory for compiled DLLs |
-| `--keep-sources` | off | Retain generated `dllmain.c` and `proxy.def` |
-| `-v / --verbose` | off | Print compiler commands and extra diagnostics |
+| `--keep-sources` | off | Keep generated `dllmain.c`, `stubs.s`, `proxy.def` |
+| `-v / --verbose` | off | Print compiler commands and diagnostics |
 
 ---
 
 ## Examples
 
-### Build proxy for all architectures (default)
-
 ```bash
-python proxydll.py \
-    -dll /path/to/version.dll \
-    -shellcode /path/to/payload.bin
-```
+# Both architectures (default)
+python proxydll.py -dll secur32.dll -shellcode payload.bin
 
-### Build only x64 proxy with a custom output name
+# x64 only, custom output name
+python proxydll.py -dll secur32.dll -shellcode payload.bin -arch x64 -o secur32
 
-```bash
-python proxydll.py \
-    -dll version.dll \
-    -shellcode payload.bin \
-    -arch x64 \
-    -o version
-```
-
-### Specify the renamed-original name and inspect generated sources
-
-```bash
-python proxydll.py \
-    -dll target.dll \
-    -shellcode shell.bin \
-    --orig-name target_backup \
-    --keep-sources \
-    -v
+# Inspect generated sources
+python proxydll.py -dll version.dll -shellcode shell.bin --keep-sources -v
 ```
 
 ---
@@ -166,107 +113,85 @@ python proxydll.py \
 output/
 └── AMD/
     ├── x64/
-    │   └── <proxy_name>.dll
+    │   └── <name>.dll
     └── x86/
-        └── <proxy_name>.dll
+        └── <name>.dll
 ```
 
-When `--keep-sources` is set, the intermediate build files are placed in:
-
+With `--keep-sources`:
 ```
-output/
-└── _sources/
-    ├── x64/
-    │   ├── dllmain.c
-    │   └── proxy.def
-    └── x86/
-        ├── dllmain.c
-        └── proxy.def
+output/_sources/
+├── x64/
+│   ├── dllmain.c
+│   ├── stubs.s
+│   └── proxy.def
+└── x86/
+    └── ...
 ```
 
 ---
 
 ## How it works
 
-### Export forwarding (DEF file)
+### Export forwarding
 
-For each named export in the original DLL, the tool generates a DEF file
-entry of the form:
+For each named export, `DllMain` loads the real DLL from `System32` using its full path:
 
+```c
+char path[MAX_PATH];
+GetSystemDirectoryA(path, MAX_PATH);
+lstrcatA(path, "\\secur32.dll");
+HMODULE orig = LoadLibraryA(path);
 ```
-ExportName=orig_name.ExportName @ordinal
+
+Using the full `System32` path avoids accidentally loading the proxy itself when it sits in a higher-priority search directory.
+
+Each export is forwarded through a generated assembly JMP stub:
+
+```asm
+AcceptSecurityContext:
+    jmpq *proxy_fns+0(%rip)   ; x64
 ```
 
-This instructs the Windows linker to create a **PE forwarder entry** in
-the export directory.  When the application resolves the import, the OS
-loader transparently redirects it to `orig_name.dll` without any runtime
-stub code.
-
-> **Important:** The original DLL must be present at runtime under the
-> `--orig-name` filename and in a directory the loader can find it
-> (typically the same directory as the proxy).
-
-### Ordinal-only exports
-
-Exports that have no name (exported by ordinal only) **cannot** be
-forwarded by this method.  The tool prints a warning for each one and
-skips it.  If the target application imports those functions by ordinal,
-the call will fail.  In practice, most modern Windows DLLs export by name.
+The `proxy_fns[]` array is filled with `GetProcAddress` pointers at load time.  All arguments, registers, and return values pass through untouched.
 
 ### Shellcode execution
 
-The shellcode bytes are embedded as a static `const unsigned char[]` array
-in the DLL's `.rdata` section.  On `DLL_PROCESS_ATTACH`, the proxy:
+Shellcode bytes are embedded in the DLL's `.rdata` section.  On load, the proxy:
 
-1. Allocates a `PAGE_EXECUTE_READWRITE` region with `VirtualAlloc`.
-2. Copies the shellcode bytes into it.
-3. Spawns a new thread (`CreateThread`) that jumps to the shellcode.
+1. Tries `NtCreateSection` / `NtMapViewOfSection` — section-backed executable memory bypasses `ProcessDynamicCodePolicy` (ACG / Arbitrary Code Guard).
+2. Falls back to `VirtualAlloc(PAGE_EXECUTE_READWRITE)` for targets without ACG.
 
-Using a thread avoids holding the loader lock during shellcode execution.
+Both paths run in a separate thread to avoid holding the loader lock.
+
+### Ordinal-only exports
+
+Exports with no name are skipped with a warning.  Most Windows system DLLs export everything by name.
 
 ---
 
-## Deployment checklist
+## Deployment
 
-1. **Identify** a DLL search-order hijacking opportunity (e.g. missing DLL
-   loaded from a writable user-controlled directory).
-2. **Generate** the proxy DLL:
-   ```bash
-   python proxydll.py -dll target.dll -shellcode payload.bin
-   ```
-3. **Rename** the original DLL in the target directory:
-   ```
-   target.dll  →  target_orig.dll
-   ```
-4. **Drop** the generated proxy DLL:
-   ```
-   output/AMD/x64/target.dll  →  <target directory>/target.dll
-   ```
-5. Both `target.dll` (proxy) and `target_orig.dll` (original) must be in
-   the same directory, or the original must be findable via the normal DLL
-   search order.
+1. Drop the generated proxy DLL into a directory searched **before** System32 — typically the target application's own folder.
+2. The proxy loads the real DLL straight from `System32` at runtime.
+
+```bash
+python proxydll.py -dll secur32.dll -shellcode payload.bin
+# → output/AMD/x64/secur32.dll
+# → output/AMD/x86/secur32.dll
+```
 
 ---
 
 ## Limitations
 
-- **ARM not supported** – ARM32/ARM64 Windows DLLs require `llvm-mingw`
-  rather than standard MinGW-w64.  Run the tool on a host with
-  `llvm-mingw` and adapt the compiler entries in `src/compiler.py` to
-  add ARM targets.
-- **Ordinal-only exports are skipped** – see above.
-- **MSVC-style name mangling** – if the original DLL uses C++ mangled
-  names, they are forwarded verbatim; unmangled wrapper names are not
-  generated.
-- **Shellcode must be position-independent** – the tool allocates memory
-  at a random base address.  Ensure your shellcode does not rely on a
-  fixed load address.
+- **System DLLs only** — the `System32` fallback only helps DLLs that live there. For application-bundled DLLs not in `System32`, deploy the proxy alongside the target and ensure the search order puts it first.
+- **ARM not supported** — requires `llvm-mingw`. Add ARM `ArchConfig` entries in `src/compiler.py` if needed.
+- **Ordinal-only exports are skipped** — see above.
+- **Shellcode must be position-independent (PIC)** — memory is allocated at a random base address.
 
 ---
 
 ## Legal notice
 
-This tool is intended for authorised security testing, penetration testing
-engagements, red-team exercises, and educational purposes only.  Use on
-systems you do not own or have explicit written permission to test is
-illegal.  The authors accept no liability for misuse.
+This tool is intended for authorised security testing, penetration testing engagements, red-team exercises, and educational purposes only. Use on systems you do not own or have explicit written permission to test is illegal. The authors accept no liability for misuse.
