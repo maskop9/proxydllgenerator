@@ -266,7 +266,7 @@ def main() -> int:
             build_dir = tempfile.mkdtemp(prefix=f"proxydll_{arch}_")
 
         try:
-            c_path, def_path, skipped = write_build_files(
+            c_path, asm_path, def_path, skipped = write_build_files(
                 build_dir=build_dir,
                 proxy_name=proxy_name,
                 orig_name=orig_name,
@@ -282,6 +282,7 @@ def main() -> int:
 
         if args.verbose or args.keep_sources:
             _info(f"  dllmain.c : {c_path}")
+            _info(f"  stubs.s   : {asm_path}")
             _info(f"  proxy.def : {def_path}")
         if skipped:
             _warn(f"  {skipped} ordinal-only export(s) not forwarded")
@@ -289,6 +290,7 @@ def main() -> int:
         ok, msg = compile_dll(
             arch=arch,
             c_path=c_path,
+            asm_path=asm_path,
             def_path=def_path,
             output_dll=output_dll,
             compiler_path=compiler_path,

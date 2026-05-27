@@ -99,6 +99,7 @@ _COMMON_FLAGS = [
 def compile_dll(
     arch: str,
     c_path: str,
+    asm_path: str,
     def_path: str,
     output_dll: str,
     compiler_path: str,
@@ -116,6 +117,7 @@ def compile_dll(
         "-shared",
         "-o", output_dll,
         c_path,
+        asm_path,   # assembly stubs (separate .s file avoids inline-asm name issues)
         def_path,
     ] + _COMMON_FLAGS + list(cfg.extra_link_flags)
 
