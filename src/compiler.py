@@ -17,11 +17,12 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class ArchConfig:
-    label: str          # human-readable  e.g. "AMD/x64"
-    compiler: str       # primary compiler binary name
-    alt_compilers: tuple[str, ...]   # fallback names to try
-    output_subdir: str  # relative path inside the output root
-    machine_types: tuple[int, ...]   # PE Machine values this arch corresponds to
+    label: str                        # human-readable  e.g. "AMD/x64"
+    compiler: str                     # primary compiler binary name
+    alt_compilers: tuple[str, ...]    # fallback names to try
+    output_subdir: str                # relative path inside the output root
+    machine_types: tuple[int, ...]    # PE Machine values this arch corresponds to
+    extra_link_flags: tuple[str, ...] = ()  # arch-specific linker flags
 
 
 AMD_X64 = ArchConfig(
@@ -38,6 +39,9 @@ AMD_X86 = ArchConfig(
     alt_compilers=("i686-w64-mingw32-gcc-win32", "i686-w64-mingw32-gcc-posix"),
     output_subdir=os.path.join("AMD", "x86"),
     machine_types=(0x014C,),
+    # --kill-at strips the @N stdcall decoration from exported symbol names
+    # so the DLL exports 'FuncA' rather than '_FuncA@8'
+    extra_link_flags=("-Wl,--kill-at",),
 )
 
 ALL_ARCH_CONFIGS: dict[str, ArchConfig] = {
@@ -87,9 +91,8 @@ def check_compilers(architectures: list[str]) -> dict[str, Optional[str]]:
 # ---------------------------------------------------------------------------
 
 _COMMON_FLAGS = [
-    "-O2",        # optimise
-    "-s",         # strip symbols – smaller output
-    "-Wl,--enable-stdcall-fixup",   # handle __stdcall @N decoration mismatches
+    "-O2",  # optimise
+    "-s",   # strip symbols – smaller output
 ]
 
 
@@ -107,13 +110,14 @@ def compile_dll(
     Returns:
         (success, message)
     """
+    cfg = ALL_ARCH_CONFIGS[arch]
     cmd = [
         compiler_path,
         "-shared",
         "-o", output_dll,
         c_path,
         def_path,
-    ] + _COMMON_FLAGS
+    ] + _COMMON_FLAGS + list(cfg.extra_link_flags)
 
     if verbose:
         print(f"    CMD: {' '.join(cmd)}")
