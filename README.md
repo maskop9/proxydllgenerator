@@ -16,6 +16,8 @@ Compilation is performed by **MinGW-w64 cross-compilers**, so the tool works on 
 ### Python 3.9+
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -64,6 +66,8 @@ Add `C:\msys64\mingw64\bin` and `C:\msys64\mingw32\bin` to `PATH`.
 ```bash
 git clone https://github.com/maskop9/proxydllgenerator
 cd proxydllgenerator
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -71,7 +75,10 @@ pip install -r requirements.txt
 
 ## Usage
 
-```
+Activate the venv first, then run:
+
+```bash
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 python proxydll.py -dll <DLL_PATH> -shellcode <SHELLCODE_PATH> [options]
 ```
 
