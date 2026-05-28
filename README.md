@@ -5,6 +5,7 @@ Given a DLL and a raw shellcode payload, it generates a replacement DLL that:
 
 - **Forwards** every named export to the real DLL via runtime `LoadLibrary` + assembly JMP stubs — no rename of the original required.
 - **Executes** the shellcode in a dedicated thread spawned from `DllMain` on `DLL_PROCESS_ATTACH`.
+- **Optionally encrypts** the embedded shellcode with AES-CBC, decrypted at runtime using the Windows BCrypt API.
 
 Compilation is performed by **MinGW-w64 cross-compilers**, so the tool works on Linux, macOS, and Windows regardless of host architecture.
 
@@ -21,6 +22,7 @@ pip install -r requirements.txt
 | Package | Purpose |
 |---------|---------|
 | `pefile >= 2023.2.7` | Parse PE export directories |
+| `pycryptodome >= 3.18.0` | AES-CBC shellcode encryption (only needed when using `--encrypt` or `--aes-key`) |
 
 ### MinGW-w64 cross-compilers
 
@@ -78,7 +80,7 @@ python proxydll.py -dll <DLL_PATH> -shellcode <SHELLCODE_PATH> [options]
 | Argument | Description |
 |----------|-------------|
 | `-dll <path>` | Path to the DLL to proxy (used to parse exports) |
-| `-shellcode <path>` | Path to a raw binary shellcode file |
+| `-shellcode <path>` | Path to a raw binary shellcode file (plain or pre-encrypted) |
 
 ### Optional
 
@@ -90,13 +92,41 @@ python proxydll.py -dll <DLL_PATH> -shellcode <SHELLCODE_PATH> [options]
 | `--keep-sources` | off | Keep generated `dllmain.c`, `stubs.s`, `proxy.def` |
 | `-v / --verbose` | off | Print compiler commands and diagnostics |
 
+### AES encryption
+
+| Argument | Description |
+|----------|-------------|
+| `--encrypt` | Encrypt the shellcode with a randomly generated AES-256-CBC key and IV |
+| `--aes-bits 128\|192\|256` | Key size when using `--encrypt` (default: `256`) |
+| `--aes-key <hex>` | Hex-encoded key for a **pre-encrypted** shellcode file (must pair with `--aes-iv`) |
+| `--aes-iv <hex>` | Hex-encoded IV for a **pre-encrypted** shellcode file (must pair with `--aes-key`) |
+
+`--encrypt` and `--aes-key` / `--aes-iv` are mutually exclusive — use one mode or the other.
+
+When `--encrypt` is used, the tool prints the generated key and IV to stdout:
+
+```
+[+]   Key (hex) : 3f8a1b...
+[+]   IV  (hex) : c72d09...
+```
+
 ---
 
 ## Examples
 
 ```bash
-# Both architectures (default)
+# Both architectures, no encryption (default)
 python proxydll.py -dll secur32.dll -shellcode payload.bin
+
+# Auto-encrypt with a random AES-256 key
+python proxydll.py -dll secur32.dll -shellcode payload.bin --encrypt
+
+# Auto-encrypt with AES-128
+python proxydll.py -dll secur32.dll -shellcode payload.bin --encrypt --aes-bits 128
+
+# Shellcode is already AES-256-CBC encrypted — supply key and IV in hex
+python proxydll.py -dll secur32.dll -shellcode payload.enc \
+    --aes-key <64-hex-chars> --aes-iv <32-hex-chars>
 
 # x64 only, custom output name
 python proxydll.py -dll secur32.dll -shellcode payload.bin -arch x64 -o secur32
@@ -153,20 +183,34 @@ AcceptSecurityContext:
     jmpq *proxy_fns+0(%rip)   ; x64
 ```
 
-The `proxy_fns[]` array is filled with `GetProcAddress` pointers at load time.  All arguments, registers, and return values pass through untouched.
+The `proxy_fns[]` array is filled with `GetProcAddress` pointers at load time. All arguments, registers, and return values pass through untouched.
 
 ### Shellcode execution
 
-Shellcode bytes are embedded in the DLL's `.rdata` section.  On load, the proxy:
+On load, the proxy spawns a thread that:
 
-1. Tries `NtCreateSection` / `NtMapViewOfSection` — section-backed executable memory bypasses `ProcessDynamicCodePolicy` (ACG / Arbitrary Code Guard).
-2. Falls back to `VirtualAlloc(PAGE_EXECUTE_READWRITE)` for targets without ACG.
+1. **Decrypts the shellcode** (if encryption was used) via the Windows BCrypt API.
+2. Tries `NtCreateSection` / `NtMapViewOfSection` — section-backed executable memory bypasses `ProcessDynamicCodePolicy` (ACG / Arbitrary Code Guard).
+3. Falls back to `VirtualAlloc(PAGE_EXECUTE_READWRITE)` for targets without ACG.
 
-Both paths run in a separate thread to avoid holding the loader lock.
+When AES encryption is enabled, shellcode bytes are stored as ciphertext in `.rdata`. The AES key and IV are also embedded in the binary. At runtime, BCrypt decrypts into a heap buffer, copies it to executable memory, then immediately zeroes the heap copy with `SecureZeroMemory` — minimising key-material exposure.
+
+### AES-CBC decryption (encrypted builds only)
+
+The generated C code uses the Windows **BCrypt** API (no third-party DLL required on the target):
+
+```
+BCryptOpenAlgorithmProvider  →  BCRYPT_AES_ALGORITHM
+BCryptSetProperty            →  BCRYPT_CHAIN_MODE_CBC
+BCryptGenerateSymmetricKey   →  key bytes embedded in .rdata
+BCryptDecrypt                →  BCRYPT_BLOCK_PADDING (removes PKCS7 padding)
+```
+
+`-lbcrypt` is added to the linker command automatically when encryption is active.
 
 ### Ordinal-only exports
 
-Exports with no name are skipped with a warning.  Most Windows system DLLs export everything by name.
+Exports with no name are skipped with a warning. Most Windows system DLLs export everything by name.
 
 ---
 
@@ -176,7 +220,7 @@ Exports with no name are skipped with a warning.  Most Windows system DLLs expor
 2. The proxy loads the real DLL straight from `System32` at runtime.
 
 ```bash
-python proxydll.py -dll secur32.dll -shellcode payload.bin
+python proxydll.py -dll secur32.dll -shellcode payload.bin --encrypt
 # → output/AMD/x64/secur32.dll
 # → output/AMD/x86/secur32.dll
 ```
@@ -189,6 +233,7 @@ python proxydll.py -dll secur32.dll -shellcode payload.bin
 - **ARM not supported** — requires `llvm-mingw`. Add ARM `ArchConfig` entries in `src/compiler.py` if needed.
 - **Ordinal-only exports are skipped** — see above.
 - **Shellcode must be position-independent (PIC)** — memory is allocated at a random base address.
+- **AES key embedded in binary** — the key and IV live in the compiled DLL's `.rdata` section. This is an obfuscation layer, not cryptographic protection against someone who can read the DLL.
 
 ---
 

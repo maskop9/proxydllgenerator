@@ -104,9 +104,15 @@ def compile_dll(
     output_dll: str,
     compiler_path: str,
     verbose: bool = False,
+    extra_link_flags: tuple[str, ...] = (),
 ) -> tuple[bool, str]:
     """
     Invoke the MinGW cross-compiler to build the proxy DLL.
+
+    Args:
+        extra_link_flags: Additional linker flags appended after the
+                          architecture defaults (e.g. ``("-lbcrypt",)``
+                          when AES encryption is used).
 
     Returns:
         (success, message)
@@ -119,7 +125,7 @@ def compile_dll(
         c_path,
         asm_path,   # assembly stubs (separate .s file avoids inline-asm name issues)
         def_path,
-    ] + _COMMON_FLAGS + list(cfg.extra_link_flags)
+    ] + _COMMON_FLAGS + list(cfg.extra_link_flags) + list(extra_link_flags)
 
     if verbose:
         print(f"    CMD: {' '.join(cmd)}")

