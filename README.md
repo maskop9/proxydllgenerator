@@ -9,6 +9,9 @@ Given a DLL and a raw shellcode payload, it generates a replacement DLL that:
 
 Compilation is performed by **MinGW-w64 cross-compilers**, so the tool works on Linux, macOS, and Windows regardless of host architecture.
 
+> **Walkthrough and background:** [Phantom DLL Hijacking](https://samipp.com.np/posts/phantom-dll-hijacking/) covers the OneDrive lab that motivated this tool, the manual proxy DLL construction it automates, detection logic, and defensive recommendations.
+
+
 ---
 
 ## Prerequisites
@@ -241,6 +244,12 @@ python proxydll.py -dll secur32.dll -shellcode payload.bin --encrypt
 - **Ordinal-only exports are skipped** — see above.
 - **Shellcode must be position-independent (PIC)** — memory is allocated at a random base address.
 - **AES key embedded in binary** — the key and IV live in the compiled DLL's `.rdata` section. This is an obfuscation layer, not cryptographic protection against someone who can read the DLL.
+
+---
+
+## Further reading
+
+- [Phantom DLL Hijacking](https://samipp.com.np/posts/phantom-dll-hijacking/) — full walkthrough of the technique, the OneDrive lab, the manual proxy DLL process this tool automates, and the detection / defence angle.
 
 ---
 
